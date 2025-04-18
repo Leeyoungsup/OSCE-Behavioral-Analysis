@@ -1,8 +1,9 @@
 
+
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
-from uniformer import uniformer
+from uniformer import uniformer,uniformer_v2
 from torchinfo import summary   
 import torch
 from torch import nn, einsum
@@ -14,8 +15,11 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from PIL import Image   
 import os
+from pytorchvideo.models.hub import x3d_xs
 from glob import glob
-device=torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
+import torchvision.transforms.functional as TF
+from torchvision.models.video import mvit_v2_s
+device=torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
 print(device)
 
 key_list=['물과 비누로 손위생',
@@ -32,18 +36,18 @@ key_list=['물과 비누로 손위생',
  '환의 정리',
  '물과 비누로 손위생 (종료 후)']
 
-params={
+params = {
     "image_size": 224,
     "frame_size": 50,
     "num_classes": 2,
     "dim": (64, 128, 256, 512),
     "depth": (3, 4, 8, 3),
-    "batch_size": 2,
+    "batch_size": 8,
     "mhsa_types": ('l', 'l', 'g', 'g'),
     "epoch": 200,
     "data_path": '../../data/',
     "second": '10sec',
-    "class_name": key_list[3],
+    "class_name": key_list[7],
     "label_path": "../../data/label/check_list/",
     "image_channel": 3
 }
@@ -52,89 +56,147 @@ params={
 
 params["second"]=f'{params["frame_size"]//5}sec'
 
-
-file_list=[f"D{str(i+1).zfill(3)}" for i in range(200)]
-remove_items = ['D151', 'D159', 'D187', 'D080']
-filtered_lst = [item for item in file_list if item not in remove_items]
 trans = transforms.Compose([
     transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
 ])
 
+# 1. 파일 리스트 생성
+file_list = [f"D{str(i+1).zfill(3)}" for i in range(200)]
+remove_items = ['D151', 'D159', 'D187', 'D080']
+filtered_lst = [item for item in file_list if item not in remove_items]
+
+# 2. 영상 데이터 및 라벨 저장 공간
+train_images = torch.zeros(len(filtered_lst), 3, params['image_channel'], params['frame_size'],
+                           params['image_size'], params['image_size'])  # [N, 3, C, T, H, W]
+image_label = []
+
+# 3. 데이터 로딩
+for i in tqdm(range(len(filtered_lst))):
+    sample_id = filtered_lst[i]
+    with open(params['label_path'] + sample_id + '.json', 'r') as f:
+        check = json.load(f)
+
+    base_path = params['data_path'] + params["second"] + '/' + params["class_name"] + '/' + sample_id
+    image_list_1 = sorted(glob(base_path + '/1/*.png'))
+    image_list_2 = [f.replace('/1/', '/2/') for f in image_list_1]
+    image_list_3 = [f.replace('/1/', '/3/') for f in image_list_1]
+
+    label = 1 if check['행동'][params["class_name"]] else 0
+    image_label.append(label)
+
+    for j in range(params['frame_size']):
+        for vid_idx, image_list in enumerate([image_list_1, image_list_2, image_list_3]):
+            img = Image.open(image_list[j]).convert('RGB').resize((params['image_size'], params['image_size']))
+            train_images[i, vid_idx, :, j] = trans(img)
+
+# 4. CustomDataset 클래스 수정
 class CustomDataset(Dataset):
-    """COCO Custom Dataset compatible with torch.utils.data.DataLoader."""
-
-    def __init__(self, parmas, video, label):
-
-        self.images = video
-        self.args = parmas
-        self.label = label
-
-    def __getitem__(self, index):
-        video1 = self.images[index,0]
-        video2 = self.images[index,1]
-        video3 = self.images[index,2]
-        label = self.label[index]
-
-        return video1,video2,video3, label
+    def __init__(self, args, video_tensor, labels, train=True):
+        self.videos = video_tensor  # [N, 3, C, T, H, W]
+        self.labels = labels
+        self.args = args
+        # 공간 증강: 랜덤 리사이즈 크롭, 랜덤 수평 뒤집기, 컬러 지터 등
+        self.spatial_aug = transforms.Compose([
+            transforms.RandomResizedCrop(args['image_size'], scale=(0.8,1.0)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        ])
+        self.train = train
+    def __getitem__(self, idx):
+        video1 = self.videos[idx, 0]
+        video2 = self.videos[idx, 1]
+        video3 = self.videos[idx, 2]
+        label = self.labels[idx]
+        if self.train:
+            # 공간 증강만: 순서는 그대로
+            def augment_clip(clip):
+                # clip: [C, T, H, W] → [T, C, H, W]
+                clip = clip.permute(1,0,2,3)
+                out = []
+                for frame in clip:
+                    img = TF.to_pil_image(frame)      # tensor→PIL
+                    img = self.spatial_aug(img)       # spatial aug
+                    out.append(TF.to_tensor(img))     # back to tensor
+                # [T, C, H, W] → [C, T, H, W]
+                return torch.stack(out, dim=1)
+            video1 = augment_clip(video1)
+            video2 = augment_clip(video2)
+            video3 = augment_clip(video3)
+        return video1, video2, video3, label
 
     def __len__(self):
-        return len(self.images)
+        return len(self.videos)
 
 
+# 5. 학습/테스트 분할
+split = int(len(train_images) * 0.7)
+train_split = int(len(train_images) * 0.9)
+train_dataset = CustomDataset(params, train_images[:train_split], F.one_hot(torch.tensor(image_label[:train_split]), num_classes=params['num_classes']).float(), train=True)
+test_dataset  = CustomDataset(params, train_images[split:], F.one_hot(torch.tensor(image_label[split:]), num_classes=params['num_classes']).float(), train=False)
 
-image_label = []
-train_images = torch.zeros(len(filtered_lst),3,params['image_channel'],params['frame_size'],params['image_size'],params['image_size'])
-for i in tqdm(range(len(filtered_lst))):
-    data_path=params['data_path']+filtered_lst[i]+'/*.png'
-    with open(params['label_path']+filtered_lst[i]+'.json', 'r') as f:
-        check = json.load(f)
-    image_list_1 = glob(params['data_path']+params["second"]+'/'+params["class_name"]+'/'+filtered_lst[i]+'/1/*.png')
-    image_list_1.sort()
-    image_list_2 =[f.replace('/1/', '/2/') for f in image_list_1]
-    image_list_3 =[f.replace('/1/', '/3/') for f in image_list_1]
-    if check['행동'][params["class_name"]]==True:
-        image_label.append(1)
-    else:
-        image_label.append(0)
-    for j in range(params['frame_size']):
-        train_images[i,0,:,j]=trans(Image.open(image_list_1[j]).convert('RGB').resize((params['image_size'], params['image_size'])))
-        train_images[i,1,:,j]=trans(Image.open(image_list_2[j]).convert('RGB').resize((params['image_size'], params['image_size'])))
-        train_images[i,2,:,j]=trans(Image.open(image_list_3[j]).convert('RGB').resize((params['image_size'], params['image_size'])))
+# 6. DataLoader 구성
+train_dataloader = DataLoader(train_dataset, batch_size=params['batch_size'], shuffle=True, drop_last=True)
+test_dataloader  = DataLoader(test_dataset, batch_size=params['batch_size'], shuffle=False, drop_last=True)
 
-train_dataset = CustomDataset(
-    params, train_images[:-30], F.one_hot(torch.tensor(image_label[:-30])))
-test_dataset = CustomDataset(
-    params, train_images[-30:], F.one_hot(torch.tensor(image_label[-30:])))
-train_dataloader = DataLoader(
-    train_dataset, batch_size=params['batch_size'], shuffle=True,drop_last=True)
-test_dataloader = DataLoader(
-    test_dataset, batch_size=params['batch_size'], shuffle=True,drop_last=True)
+class Multix3d(nn.Module):
+    def __init__(self, num_classes=2, pretrained=True):
+        super().__init__()
 
-model = uniformer.MultiVideoUniformer(
-    num_classes = params['num_classes'],                 # number of output classes
-    dims = params['dim'],         # feature dimensions per stage (4 stages)
-    depths = params['depth'],              # depth at each stage
-    mhsa_types = params['mhsa_types']   # aggregation type at each stage, 'l' stands for local, 'g' stands for global
+        # 세 개의 MViTv2-S 모델을 생성 (출력 차원은 768)
+        self.backbone1 = x3d_xs(pretrained=pretrained, progress=True)
+        self.backbone2 =  x3d_xs(pretrained=pretrained, progress=True)
+        self.backbone3 = x3d_xs(pretrained=pretrained, progress=True)
+        self.in_features = self.backbone1.blocks[-1].proj.in_features
+        # 세 feature를 concat 후 최종 분류
+        self.classifier = nn.Sequential(
+            nn.Linear(400* 3, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, num_classes)
+        )
+
+    def forward(self, video1, video2, video3):
+        # 입력: [B, C, T, H, W]
+        feat1 = self.backbone1(video1)  # [B, 768]
+        feat2 = self.backbone2(video2)
+        feat3 = self.backbone3(video3)
+    
+        fused = torch.cat([feat1, feat2, feat3], dim=1)  # [B, 2304]
+        return self.classifier(fused)  # [B, num_classes]
+    
+model = Multix3d(
+    num_classes=params['num_classes']
 ).to(device)
 
-video_size = (params['batch_size'], params['image_channel'], params['frame_size'], params['image_size'], params['image_size']) # (batch, channels, time, height, width)
-optimizer = optim.AdamW(model.parameters(), lr=1e-4)
-criterion = nn.CrossEntropyLoss()
-summary(
-    model,
-    input_size=[
-        (params['batch_size'], params['image_channel'], params['frame_size'], params['image_size'], params['image_size']),  # video1
-        (params['batch_size'], params['image_channel'], params['frame_size'], params['image_size'], params['image_size']),  # video2
-        (params['batch_size'], params['image_channel'], params['frame_size'], params['image_size'], params['image_size'])   # video3
-    ],
-    device=device
+# 입력 비디오 크기 정의
+video_size = (
+    params['batch_size'],       # B
+    params['image_channel'],    # C = 3
+    params["frame_size"],                         # T = 16 (MViT 기준)
+    params['image_size'],       # H
+    params['image_size']        # W
 )
-def create_dir(path):  
+
+# Optimizer & Loss 정의
+optimizer = optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
+criterion = nn.CrossEntropyLoss()
+
+# 디렉토리 생성 함수
+def create_dir(path):
     if not os.path.exists(path):
         os.makedirs(path)
-        
-        
+
+# 모델 구조 출력
+summary(
+    model,
+    input_size=[video_size, video_size, video_size],  # 3개 비디오 입력
+    device=str(device)
+)
+
+
 best_val_loss = float('inf')
+
 for epc in range(params['epoch']):
     model.train()
     total_loss = 0
@@ -153,7 +215,7 @@ for epc in range(params['epoch']):
             lab = lab.to(device)
 
             # 모델 forward
-            output = model(video1, video2, video3)  # (B, num_classes)
+            output = F.softmax(model(video1, video2, video3),dim=1) # (B, num_classes)
             loss = criterion(output, lab.argmax(dim=1))  # CrossEntropyLoss expects class index
 
             # 역전파
@@ -179,6 +241,7 @@ for epc in range(params['epoch']):
                     "LR": optimizer.param_groups[0]["lr"]
                 }
             )
+
     # ======== Validation ========
     model.eval()
     val_loss = 0
@@ -194,7 +257,7 @@ for epc in range(params['epoch']):
                 video3 = video3.to(device)
                 lab = lab.to(device)
 
-                output = model(video1, video2, video3)
+                output = F.softmax(model(video1, video2, video3),dim=1)
                 loss = criterion(output, lab.argmax(dim=1))
 
                 val_loss += loss.item()
@@ -213,8 +276,8 @@ for epc in range(params['epoch']):
     avg_val_loss = val_loss / val_steps
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
-        c1=params["class_name"]
-        c2=params["second"]
+        c1 = params["class_name"]
+        c2 = params["second"]
         create_dir(f"../../model/{c1}/")
         torch.save(model.state_dict(), f"../../model/{c1}/best_model_{c2}.pt")
         print(f"✅ Model saved at epoch {epc+1} with validation loss {best_val_loss:.4f}")
