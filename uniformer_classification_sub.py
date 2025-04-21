@@ -22,10 +22,10 @@ from torchvision.models.video import mvit_v2_s
 device=torch.device("cuda:4" if torch.cuda.is_available() else "cpu")
 print(device)
 
-# key_value="필요한 물품 준비"
-# key_list=["손소독제", "주사기", "투약카드", "tray", "알콜솜"]
-key_value="사용한 물품 정리"
-key_list=["주사바늘 되씌우지 않음","주사바늘 손상성 폐기물 버림"]
+key_value="필요한 물품 준비"
+key_list=["손소독제", "주사기", "투약카드", "tray", "알콜솜"]
+# key_value="사용한 물품 정리"
+# key_list=["주사바늘 되씌우지 않음","주사바늘 손상성 폐기물 버림"]
   
 params = {
     "image_size": 224,
