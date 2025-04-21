@@ -19,43 +19,29 @@ from pytorchvideo.models.hub import x3d_xs
 from glob import glob
 import torchvision.transforms.functional as TF
 from torchvision.models.video import mvit_v2_s
-device=torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+device=torch.device("cuda:4" if torch.cuda.is_available() else "cpu")
 print(device)
 
-key_list=['물과 비누로 손위생',
- '투약처방과 투약원칙 확인 (손으로 짚어서)',
- '근육주사 약물을 정확한 용량과 방법으로 준비',
- '손소독제로 손위생',
- '대상자의 입원팔찌와 투약카드 대조하여 확인',
- '주사부위 노출 후, 주사부위 선정(삼각근)',
- '물과 비누,알콜젤로 손위생 수행',
- '소독솜으로 닦고, 한손으로 주사바늘 뚜껑 제거',
- '주사바늘 90도로 주사부위 찌름',
- '내관당겨보고, 약물 천천히 주입',
- '삽입각도와 같이 빼고, 주사부위 압박',
- '환의 정리',
- '물과 비누로 손위생 (종료 후)']
-
+# key_value="필요한 물품 준비"
+# key_list=["손소독제", "주사기", "투약카드", "tray", "알콜솜"]
+key_value="사용한 물품 정리"
+key_list=["주사바늘 되씌우지 않음","주사바늘 손상성 폐기물 버림"]
+  
 params = {
     "image_size": 224,
     "frame_size": 50,
-    "num_classes": 2,
+    "num_classes": len(key_list),
     "dim": (64, 128, 256, 512),
     "depth": (3, 4, 8, 3),
     "batch_size": 8,
     "mhsa_types": ('l', 'l', 'g', 'g'),
-    "epoch": 500,
+    "epoch": 200,
     "data_path": '../../data/',
     "second": '10sec',
-    "class_name": key_list[0],
+    "class_name": key_value,
     "label_path": "../../data/label/check_list/",
     "image_channel": 3
 }
-
-# for _ in (9,12):
-_=6
-params["class_name"]=key_list[_]
-
 params["second"]=f'{params["frame_size"]//5}sec'
 
 trans = transforms.Compose([
@@ -70,30 +56,22 @@ filtered_lst = [item for item in file_list if item not in remove_items]
 
 # 2. 영상 데이터 및 라벨 저장 공간
 train_images = torch.zeros(len(filtered_lst), 3, params['image_channel'], params['frame_size'],
-                        params['image_size'], params['image_size'])  # [N, 3, C, T, H, W]
-image_label = []
+                           params['image_size'], params['image_size'])  # [N, 3, C, T, H, W]
+image_label = torch.zeros(len(filtered_lst),len(key_list))  # [N, num_classes]
 
 # 3. 데이터 로딩
 for i in tqdm(range(len(filtered_lst))):
     sample_id = filtered_lst[i]
     with open(params['label_path'] + sample_id + '.json', 'r') as f:
         check = json.load(f)
-    if params["class_name"]=='물과 비누,알콜젤로 손위생 수행':
-        base_path = params['data_path'] + params["second"] + '/' + params["class_name"] + '/' + sample_id
-        image_list_1 = sorted(glob(base_path + '/1/*.png'))
-        image_list_2 = [f.replace('/1/', '/2/') for f in image_list_1]
-        image_list_3 = [f.replace('/1/', '/3/') for f in image_list_1]
 
-        label = 1 if check['행동']["물과 비누 /알콜젤로 손위생 수행"] else 0
-        image_label.append(label)
-    else:
-        base_path = params['data_path'] + params["second"] + '/' + params["class_name"] + '/' + sample_id
-        image_list_1 = sorted(glob(base_path + '/1/*.png'))
-        image_list_2 = [f.replace('/1/', '/2/') for f in image_list_1]
-        image_list_3 = [f.replace('/1/', '/3/') for f in image_list_1]
-
-        label = 1 if check['행동'][params["class_name"]] else 0
-        image_label.append(label)
+    base_path = params['data_path'] + params["second"] + '/' + params["class_name"] + '/' + sample_id
+    image_list_1 = sorted(glob(base_path + '/1/*.png'))
+    image_list_2 = [f.replace('/1/', '/2/') for f in image_list_1]
+    image_list_3 = [f.replace('/1/', '/3/') for f in image_list_1]
+    for k in range(len(key_list)):
+        label = 1 if check['행동'][params["class_name"]][key_list[k]] else 0
+        image_label[i,k]= label
 
     for j in range(params['frame_size']):
         for vid_idx, image_list in enumerate([image_list_1, image_list_2, image_list_3]):
@@ -125,16 +103,17 @@ class CustomDataset(Dataset):
 
 
 # 5. 학습/테스트 분할
-split = int(len(train_images) * 0.8)
-train_dataset = CustomDataset(params, train_images[:split], F.one_hot(torch.tensor(image_label[:split]), num_classes=params['num_classes']).float(), train=True)
-test_dataset  = CustomDataset(params, train_images[split:], F.one_hot(torch.tensor(image_label[split:]), num_classes=params['num_classes']).float(), train=False)
+split = int(len(train_images) * 0.7)
+train_dataset = CustomDataset(params, train_images[:split], image_label[:split].float(), train=True)
+test_dataset  = CustomDataset(params, train_images[split:], image_label[split:].float(), train=False)
 
 # 6. DataLoader 구성
 train_dataloader = DataLoader(train_dataset, batch_size=params['batch_size'], shuffle=True, drop_last=True)
 test_dataloader  = DataLoader(test_dataset, batch_size=params['batch_size'], shuffle=False, drop_last=True)
 
+
 class Multix3d(nn.Module):
-    def __init__(self, num_classes=2, pretrained=True):
+    def __init__(self, num_classes=len(key_list), pretrained=True):
         super().__init__()
 
         # 세 개의 MViTv2-S 모델을 생성 (출력 차원은 768)
@@ -174,7 +153,7 @@ video_size = (
 
 # Optimizer & Loss 정의
 optimizer = optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
-criterion = nn.CrossEntropyLoss()
+criterion = nn.BCEWithLogitsLoss()
 
 # 디렉토리 생성 함수
 def create_dir(path):
@@ -187,7 +166,6 @@ summary(
     input_size=[video_size, video_size, video_size],  # 3개 비디오 입력
     device=str(device)
 )
-
 
 best_val_loss = float('inf')
 
@@ -209,8 +187,8 @@ for epc in range(params['epoch']):
             lab = lab.to(device)
 
             # 모델 forward
-            output = F.softmax(model(video1, video2, video3),dim=1) # (B, num_classes)
-            loss = criterion(output, lab.argmax(dim=1))  # CrossEntropyLoss expects class index
+            output = model(video1, video2, video3) # (B, num_classes)
+            loss = criterion(output, lab)  # CrossEntropyLoss expects class index
 
             # 역전파
             loss.backward()
@@ -221,9 +199,9 @@ for epc in range(params['epoch']):
             steps += 1
 
             # Accuracy 계산
-            preds = output.argmax(dim=1)
-            targets = lab.argmax(dim=1)
-            total_correct += (preds == targets).sum().item()
+            preds = torch.where(output>0.5,1,0)
+            targets = lab
+            total_correct += (preds == targets).sum().item()/params['num_classes']
             total_samples += lab.size(0)
 
             tqdmDataLoader.set_postfix(
@@ -251,14 +229,14 @@ for epc in range(params['epoch']):
                 video3 = video3.to(device)
                 lab = lab.to(device)
 
-                output = F.softmax(model(video1, video2, video3),dim=1)
-                loss = criterion(output, lab.argmax(dim=1))
+                output = model(video1, video2, video3)
+                loss = criterion(output, lab)
 
                 val_loss += loss.item()
                 val_steps += 1
-                preds = output.argmax(dim=1)
-                targets = lab.argmax(dim=1)
-                val_correct += (preds == targets).sum().item()
+                preds = torch.where(output>0.5,1,0)
+                targets = lab
+                val_correct += (preds == targets).sum().item()/params['num_classes']
                 val_total += lab.size(0)
 
                 tqdmVal.set_postfix(
